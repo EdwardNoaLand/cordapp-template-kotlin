@@ -1,20 +1,22 @@
 package com.template
 
 import co.paralleluniverse.fibers.Suspendable
+import net.corda.core.contracts.Command
+import net.corda.core.contracts.StateAndContract
 import net.corda.core.flows.*
+import net.corda.core.identity.Party
 import net.corda.core.messaging.CordaRPCOps
 import net.corda.core.serialization.SerializationWhitelist
-import net.corda.webserver.services.WebServerPluginRegistry
+import net.corda.core.transactions.TransactionBuilder
+import net.corda.core.utilities.ProgressTracker
 import java.util.function.Function
 import javax.ws.rs.GET
 import javax.ws.rs.Path
 import javax.ws.rs.Produces
 import javax.ws.rs.core.MediaType
 import javax.ws.rs.core.Response
-import net.corda.core.contracts.Command
-import net.corda.core.identity.Party
-import net.corda.core.transactions.TransactionBuilder
-import net.corda.core.utilities.ProgressTracker
+import net.corda.core.contracts.requireThat
+import net.corda.core.transactions.SignedTransaction
 
 // *****************
 // * API Endpoints *
@@ -46,36 +48,69 @@ class IOUFlow(val iouValue: Int,
         // We retrieve the notary identity from the network map
         val notary = serviceHub.networkMapCache.notaryIdentities[0]
 
-        // We create the transaction components
-        val outputState = IOUState(iouValue, ourIdentity, otherParty)
-        val cmd = Command(TemplateContract.Commands.Action(), ourIdentity.owningKey)
+        // // We create the transaction components
+        // val outputState = IOUState(iouValue, ourIdentity, otherParty)
+        // val cmd = Command(TemplateContract.Commands.Action(), ourIdentity.owningKey)
 
         // We create a transaction builder and add the components
         val txBuilder = TransactionBuilder(notary = notary)
-                .addOutputState(outputState, TEMPLATE_CONTRACT_ID)
-                .addCommand(cmd)
-                
-        // We sign the transaction
-        val signedTX = serviceHub.signInitialTransaction(txBuilder)
-        
-        // We finalise the transaction
-        subFlow(FinalityFlow(signedTX))
+
+        // We create the transaction components
+        val outputState = IOUState(iouValue, ourIdentity, otherParty)
+        val outputContractAndState = StateAndContract(outputState, IOU_CONTRACT_ID)
+        val cmd = Command(IOUContract.Create(), listOf(ourIdentity.owningKey, otherParty.owningKey))
+
+        // We add the items to the builder
+        txBuilder.withItems(outputContractAndState, cmd)
+
+        // Verifying the transaction
+        txBuilder.verify(serviceHub)
+
+        // Signing the transaction
+        val signedTx = serviceHub.signInitialTransaction(txBuilder)
+
+        // Creating a session with the oterh party
+        val otherpartySession = initiateFlow(otherParty)
+
+        // Obtaining the counterparty's signature
+        val fullSignedTx = subFlow(CollectSignaturesFlow(signedTx, listOf(otherpartySession), CollectSignaturesFlow.tracker()))
+
+        // Finalising the transaction
+        subFlow(FinalityFlow(fullSignedTx))
+    }
+}
+
+// Define IOUFlowResponder:
+@InitiatedBy(IOUFlow::class)
+class IOUFlowResponder(val otherPartySession: FlowSession) : FlowLogic<Unit>() {
+    @Suspendable
+    override fun call() {
+        val signTransactionFlow = object : SignTransactionFlow(otherPartySession, SignTransactionFlow.tracker()) {
+            override fun checkTransaction(stx: SignedTransaction) = requireThat {
+                val output = stx.tx.outputs.single().data
+                "This must be an IOU transaction." using (output is IOUState)
+                val iou = output as IOUState
+                "The IOU's value can't be too high." using (iou.value < 100)
+            }
+        }
+
+        subFlow(signTransactionFlow)
     }
 }
 
 // ***********
 // * Plugins *
 // ***********
-class TemplateWebPlugin : WebServerPluginRegistry {
-    // A list of classes that expose web JAX-RS REST APIs.
-    override val webApis: List<Function<CordaRPCOps, out Any>> = listOf(Function(::TemplateApi))
-    //A list of directories in the resources directory that will be served by Jetty under /web.
-    // This template's web frontend is accessible at /web/template.
-    override val staticServeDirs: Map<String, String> = mapOf(
-            // This will serve the templateWeb directory in resources to /web/template
-            "template" to javaClass.classLoader.getResource("templateWeb").toExternalForm()
-    )
-}
+// class TemplateWebPlugin : WebServerPluginRegistry {
+//     // A list of classes that expose web JAX-RS REST APIs.
+//     override val webApis: List<Function<CordaRPCOps, out Any>> = listOf(Function(::TemplateApi))
+//     //A list of directories in the resources directory that will be served by Jetty under /web.
+//     // This template's web frontend is accessible at /web/template.
+//     override val staticServeDirs: Map<String, String> = mapOf(
+//             // This will serve the templateWeb directory in resources to /web/template
+//             "template" to javaClass.classLoader.getResource("templateWeb").toExternalForm()
+//     )
+// }
 
 // Serialization whitelist.
 class TemplateSerializationWhitelist : SerializationWhitelist {
